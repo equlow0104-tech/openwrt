@@ -141,8 +141,7 @@ jobs:
           CONFIG_TARGET_qualcommbe_ipq53xx=y
           CONFIG_TARGET_qualcommbe_ipq53xx_DEVICE_glinet_gl-be6500=y
           CONFIG_PACKAGE_luci=y
-          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
-          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+          CONFIG_LUCI_LANG_zh_Hans=y
           # CONFIG_PACKAGE_dnsmasq is not set
           CONFIG_PACKAGE_dnsmasq-full=y
           CONFIG_PACKAGE_dnsmasq_full_nftset=y
@@ -163,23 +162,45 @@ jobs:
           # CONFIG_SDK is not set
           # CONFIG_IB is not set
           EOF
-          make defconfig 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/configure.log"
-          grep -Fxq 'CONFIG_TARGET_qualcommbe_ipq53xx_DEVICE_glinet_gl-be6500=y' .config
-          for package in luci luci-i18n-base-zh-cn dnsmasq-full kmod-tun kmod-inet-diag kmod-nft-tproxy kmod-nft-socket kmod-nf-conntrack-netlink; do
-            grep -Fxq "CONFIG_PACKAGE_$package=y" .config
-          done
-          grep -Fxq 'CONFIG_PACKAGE_luci-app-openclash=m' .config
-          grep -Eq '^CONFIG_PACKAGE_luci-compat=[my]$' .config
-          grep -Fxq 'CONFIG_SIGN_EACH_PACKAGE=y' .config
-          if grep -Fxq 'CONFIG_BUILDBOT=y' .config; then
-            echo "::error::This offline bundle requires the local build signing key in the firmware."
-            exit 1
+          logs="$GITHUB_WORKSPACE/build-logs"
+          cp .config "$logs/requested.config"
+          # Bash pipefail preserves make's status. Save the output config even on failure.
+          status=0
+          make defconfig 2>&1 | tee "$logs/configure.log" || status=$?
+          if [[ -f .config ]]; then cp .config "$logs/build.config"; fi
+          if (( status != 0 )); then
+            echo "::error::make defconfig failed (exit $status); see configure.log"
+            exit "$status"
           fi
-          if grep -Fxq 'CONFIG_PACKAGE_dnsmasq=y' .config; then
-            echo "::error::Both dnsmasq variants selected; refusing to build."
-            exit 1
-          fi
-          cp .config "$GITHUB_WORKSPACE/build-logs/build.config"
+          python3 - <<'PY' 2>&1 | tee "$logs/config-check.log"
+          import os
+          import re
+          from pathlib import Path
+
+          def selections(path):
+              return dict(re.findall(r"^(CONFIG_[^=\s]+)=(.+)$", Path(path).read_text(), re.M))
+
+          requested = selections(Path(os.environ["GITHUB_WORKSPACE"]) / "build-logs/requested.config")
+          actual = selections(".config")
+          expected = {key: {value} for key, value in requested.items()}
+          expected.update({
+              "CONFIG_PACKAGE_luci-i18n-base-zh-cn": {"y"},
+              "CONFIG_PACKAGE_luci-i18n-firewall-zh-cn": {"y"},
+              "CONFIG_PACKAGE_luci-compat": {"m", "y"},
+              "CONFIG_PACKAGE_dnsmasq": {"n"},
+              "CONFIG_BUILDBOT": {"n"},
+          })
+          mismatches = []
+          for name, allowed in expected.items():
+              value = actual.get(name, "n")
+              if value not in allowed:
+                  mismatches.append(f"{name}: expected {' or '.join(sorted(allowed))}, got {value}")
+          for message in mismatches:
+              print(f"::error::{message}")
+          if mismatches:
+              raise SystemExit(1)
+          print("Required device, language, runtime packages and signing options verified.")
+          PY
           ./scripts/diffconfig.sh > "$GITHUB_WORKSPACE/build-logs/diffconfig.txt"
 
       - name: Download sources
@@ -245,28 +266,28 @@ jobs:
           selected = set(re.findall(r"^CONFIG_PACKAGE_(.+)=m$", Path(".config").read_text(), re.M))
           if "luci-app-openclash" not in selected:
               raise SystemExit("OpenClash is not selected as an offline package")
-          available = list(Path("bin").rglob("*.apk"))
-          # Kconfig names can differ from APK names due to ABI suffixes.
-          # Use generated package metadata rather than guessing file prefixes.
-          metadata = {}
-          packageinfo = Path("tmp/.packageinfo").read_text()
-          for match in re.finditer(r"^Package: ([^\n]+)\n(.*?)(?=^Package: |\Z)", packageinfo, re.M | re.S):
-              name, body = match.groups()
-              fields = dict(re.findall(r"^(Version|ABI-Version):\s*([^\n]*)$",
-                                       body.split("Description:", 1)[0], re.M))
-              metadata[name.strip()] = fields
+          # apk filenames separate the package name and actual version at the last
+          # dash followed by a digit. LuCI's metadata dump can use dummy versions.
+          available = {}
+          for path in Path("bin").rglob("*.apk"):
+              match = re.fullmatch(r"(.+)-([0-9].*)", path.stem)
+              if match:
+                  available.setdefault(match[1], []).append(path)
+          pkginfo_dirs = list(Path("staging_dir").glob("target-*/pkginfo"))
+          if len(pkginfo_dirs) != 1:
+              raise SystemExit(f"Expected one target pkginfo directory, got: {pkginfo_dirs}")
           copied = {}
           for name in sorted(selected):
-              fields = metadata.get(name, {})
-              version = fields.get("Version", "").strip()
-              abi = fields.get("ABI-Version", "").strip()
-              if not version:
-                  raise SystemExit(f"No version metadata for selected package: {name}")
-              suffix = ("-" if name[-1].isdigit() else "") + abi if abi else ""
-              filename = f"{name}{suffix}-{version}.apk"
-              matches = [p for p in available if p.name == filename]
+              abi_file = pkginfo_dirs[0] / f"{name}.version"
+              abi = abi_file.read_text().strip() if abi_file.exists() else ""
+              package_name = name
+              if abi and not name.startswith("kmod-"):
+                  package_name += ("-" if name[-1].isdigit() else "") + abi
+              matches = available.get(package_name, [])
               if not matches:
-                  raise SystemExit(f"No built APK found for selected package: {name}: expected {filename}")
+                  raise SystemExit(f"No built APK for CONFIG_PACKAGE_{name}=m (expected {package_name})")
+              if len({p.name for p in matches}) != 1:
+                  raise SystemExit(f"Multiple versions built for {package_name}: {matches}")
               for source in matches:
                   digest = hashlib.sha256(source.read_bytes()).hexdigest()
                   if source.name in copied and copied[source.name] != digest:
