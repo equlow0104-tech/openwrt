@@ -1,0 +1,352 @@
+# Save as .github/workflows/build-flint3e-openclash.yml
+# Firmware: matching kernel modules + dnsmasq-full + Chinese LuCI.
+# OpenClash and its userspace dependencies: signed offline APK bundle from the same build.
+# Run manually from Actions. No personal access token or repository secrets needed.
+name: Build Flint 3e OpenClash
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: JiaY-shi/openwrt branch, tag, or commit SHA
+        required: true
+        default: '380e33a58f3380bcaecb893c4500b0f2e849fe56'
+        type: string
+      openclash_ref:
+        description: vernesong/OpenClash branch, tag, or commit SHA
+        required: true
+        default: master
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Free disk space on the disposable GitHub runner
+        run: |
+          # These paths belong to the hosted runner, not your own computer.
+          # Do not reuse this cleanup step on a self-hosted machine.
+          df -h "$GITHUB_WORKSPACE"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo apt-get clean
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3 python3-setuptools python3-pyelftools \
+            rsync swig unzip zlib1g-dev file wget curl libelf-dev pkg-config \
+            xsltproc zstd bzip2 xz-utils patch ca-certificates
+          sudo apt-get clean
+          available_kib=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')
+          if (( available_kib < 30 * 1024 * 1024 )); then
+            echo "::error::Less than 30 GiB free. Use a runner with more disk space."
+            exit 1
+          fi
+
+      - name: Check out firmware source
+        uses: actions/checkout@v7
+        with:
+          repository: JiaY-shi/openwrt
+          ref: ${{ inputs.source_ref }}
+          path: openwrt
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out OpenClash source
+        uses: actions/checkout@v7
+        with:
+          repository: vernesong/OpenClash
+          ref: ${{ inputs.openclash_ref }}
+          path: openclash-source
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: luci-app-openclash
+
+      - name: Pin feeds to the previous working firmware
+        working-directory: openwrt
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          pins = {
+              "packages": "5af91abfc0c34c4e412f68ad8833dc43c986e91c",
+              "luci": "57126beca6fd98d4b9db28e96873412f2715f83a",
+              "routing": "ea8633da9c461a9bdc62a0323439d31180762e03",
+              "telephony": "06feffc2c154993f555b43756ef7db6dd7e58225",
+              "video": "7d3dcdebda95e50604cf068ed9b8fef29c94069e",
+          }
+          path = Path("feeds.conf.default")
+          lines, found = [], set()
+          for line in path.read_text().splitlines():
+              fields = line.split()
+              if len(fields) == 3 and fields[0] == "src-git" and fields[1] in pins:
+                  name = fields[1]
+                  url = fields[2].split("^", 1)[0].split(";", 1)[0]
+                  line = f"src-git {name} {url}^{pins[name]}"
+                  found.add(name)
+              lines.append(line)
+          if found != set(pins):
+              raise SystemExit("Feed layout changed; review the pinned feed configuration.")
+          path.write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Update and install feeds
+        working-directory: openwrt
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/build-logs"
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/build-logs/source-commit.txt"
+          ./scripts/feeds update -a 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/feeds-update.log"
+          ./scripts/feeds install -a 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/feeds-install.log"
+          for feed in feeds/*; do
+            if [[ -d "$feed/.git" || -f "$feed/.git" ]]; then
+              printf '%s %s\n' "$feed" "$(git -C "$feed" rev-parse HEAD)"
+            fi
+          done > "$GITHUB_WORKSPACE/build-logs/feed-commits.txt"
+
+      - name: Add OpenClash to the build
+        working-directory: openwrt
+        run: |
+          cp -a ../openclash-source/luci-app-openclash package/luci-app-openclash
+          git -C ../openclash-source rev-parse HEAD > "$GITHUB_WORKSPACE/build-logs/openclash-commit.txt"
+          # OpenClash calls po2lmo during preparation; declare its host-tool dependency.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("package/luci-app-openclash/Makefile")
+          text = p.read_text()
+          anchor = "include $(INCLUDE_DIR)/package.mk"
+          if anchor not in text:
+              raise SystemExit("OpenClash Makefile layout changed; review host dependencies.")
+          if "luci-base/host" not in text:
+              p.write_text(text.replace(anchor, "PKG_BUILD_DEPENDS += luci-base/host\n\n" + anchor, 1))
+          PY
+          mkdir -p files/etc
+          printf '%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > files/etc/flint3e-build-id
+          cp files/etc/flint3e-build-id "$GITHUB_WORKSPACE/build-logs/firmware-build-id"
+
+      - name: Configure matching modules and offline OpenClash packages
+        working-directory: openwrt
+        run: |
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommbe=y
+          CONFIG_TARGET_qualcommbe_ipq53xx=y
+          CONFIG_TARGET_qualcommbe_ipq53xx_DEVICE_glinet_gl-be6500=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+          # CONFIG_PACKAGE_dnsmasq is not set
+          CONFIG_PACKAGE_dnsmasq-full=y
+          CONFIG_PACKAGE_dnsmasq_full_nftset=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-nft-socket=y
+          CONFIG_PACKAGE_kmod-nf-conntrack-netlink=y
+          CONFIG_PACKAGE_luci-app-openclash=m
+          CONFIG_PACKAGE_luci-compat=m
+          CONFIG_SIGNED_PACKAGES=y
+          CONFIG_SIGN_EACH_PACKAGE=y
+          CONFIG_SIGNATURE_CHECK=y
+          # CONFIG_BUILDBOT is not set
+          # CONFIG_ALL_KMODS is not set
+          # CONFIG_ALL_NONSHARED is not set
+          # CONFIG_ALL is not set
+          # CONFIG_SDK is not set
+          # CONFIG_IB is not set
+          EOF
+          make defconfig 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/configure.log"
+          grep -Fxq 'CONFIG_TARGET_qualcommbe_ipq53xx_DEVICE_glinet_gl-be6500=y' .config
+          for package in luci luci-i18n-base-zh-cn dnsmasq-full kmod-tun kmod-inet-diag kmod-nft-tproxy kmod-nft-socket kmod-nf-conntrack-netlink; do
+            grep -Fxq "CONFIG_PACKAGE_$package=y" .config
+          done
+          grep -Fxq 'CONFIG_PACKAGE_luci-app-openclash=m' .config
+          grep -Eq '^CONFIG_PACKAGE_luci-compat=[my]$' .config
+          grep -Fxq 'CONFIG_SIGN_EACH_PACKAGE=y' .config
+          if grep -Fxq 'CONFIG_BUILDBOT=y' .config; then
+            echo "::error::This offline bundle requires the local build signing key in the firmware."
+            exit 1
+          fi
+          if grep -Fxq 'CONFIG_PACKAGE_dnsmasq=y' .config; then
+            echo "::error::Both dnsmasq variants selected; refusing to build."
+            exit 1
+          fi
+          cp .config "$GITHUB_WORKSPACE/build-logs/build.config"
+          ./scripts/diffconfig.sh > "$GITHUB_WORKSPACE/build-logs/diffconfig.txt"
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j8 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/download.log"
+
+      - name: Build firmware
+        working-directory: openwrt
+        timeout-minutes: 300
+        run: |
+          # Explicit bash shell enables pipefail: tee cannot hide make failures.
+          make -j"$(nproc)" V=s 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/build.log"
+
+      - name: Verify firmware size and required packages
+        working-directory: openwrt
+        run: |
+          python3 - <<'PY' 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/image-check.log"
+          from pathlib import Path
+          import json, tarfile
+          target = Path("bin/targets/qualcommbe/ipq53xx")
+          metadata = json.loads((target / "profiles.json").read_text())
+          if metadata["target"] != "qualcommbe/ipq53xx":
+              raise SystemExit("Unexpected target")
+          profile = metadata["profiles"]["glinet_gl-be6500"]
+          limits = profile["file_size_limits"]
+          images = list(target.glob("*gl-be6500*-squashfs-factory.bin"))
+          images += list(target.glob("*gl-be6500*-squashfs-factory.ubi"))
+          upgrades = list(target.glob("*gl-be6500*-squashfs-sysupgrade.bin"))
+          if len(images) != 2 or len(upgrades) != 1:
+              raise SystemExit("Expected factory.bin, factory.ubi and sysupgrade.bin")
+          for image in images + upgrades:
+              size = image.stat().st_size
+              print(f"{image.name}: {size} bytes; declared image limit: {limits['image']}")
+              if size > limits["image"]:
+                  raise SystemExit("Image exceeds the source's declared limit; do not enlarge partition limits.")
+          with tarfile.open(upgrades[0]) as tar:
+              kernels = [m for m in tar.getmembers() if m.name.endswith("/kernel") and m.isfile()]
+              if len(kernels) != 1 or kernels[0].size > limits["kernel"]:
+                  raise SystemExit("Kernel missing or exceeds declared kernel size limit.")
+              print(f"Kernel: {kernels[0].size} bytes; limit: {limits['kernel']}")
+          manifests = list(target.glob("*gl-be6500*.manifest"))
+          if len(manifests) != 1:
+              raise SystemExit("Expected one device manifest")
+          installed = {line.split(" - ", 1)[0] for line in manifests[0].read_text().splitlines()}
+          required = {"dnsmasq-full", "kmod-tun", "kmod-inet-diag", "kmod-nft-tproxy",
+                      "kmod-nft-socket", "kmod-nf-conntrack-netlink", "luci-i18n-base-zh-cn"}
+          if required - installed or "dnsmasq" in installed:
+              raise SystemExit(f"Unexpected firmware packages; missing={required - installed}")
+          print("Firmware target, package selection and conservative size checks passed.")
+          PY
+
+      - name: Collect signed offline packages
+        working-directory: openwrt
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, re, shutil, hashlib
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          bundle = workspace / "offline" / "openclash-offline"
+          packages = bundle / "packages"
+          packages.mkdir(parents=True, exist_ok=True)
+          # =m packages and their dependencies are built but omitted from the firmware image.
+          selected = set(re.findall(r"^CONFIG_PACKAGE_(.+)=m$", Path(".config").read_text(), re.M))
+          if "luci-app-openclash" not in selected:
+              raise SystemExit("OpenClash is not selected as an offline package")
+          available = list(Path("bin").rglob("*.apk"))
+          # Kconfig names can differ from APK names due to ABI suffixes.
+          # Use generated package metadata rather than guessing file prefixes.
+          metadata = {}
+          packageinfo = Path("tmp/.packageinfo").read_text()
+          for match in re.finditer(r"^Package: ([^\n]+)\n(.*?)(?=^Package: |\Z)", packageinfo, re.M | re.S):
+              name, body = match.groups()
+              fields = dict(re.findall(r"^(Version|ABI-Version):\s*([^\n]*)$",
+                                       body.split("Description:", 1)[0], re.M))
+              metadata[name.strip()] = fields
+          copied = {}
+          for name in sorted(selected):
+              fields = metadata.get(name, {})
+              version = fields.get("Version", "").strip()
+              abi = fields.get("ABI-Version", "").strip()
+              if not version:
+                  raise SystemExit(f"No version metadata for selected package: {name}")
+              suffix = ("-" if name[-1].isdigit() else "") + abi if abi else ""
+              filename = f"{name}{suffix}-{version}.apk"
+              matches = [p for p in available if p.name == filename]
+              if not matches:
+                  raise SystemExit(f"No built APK found for selected package: {name}: expected {filename}")
+              for source in matches:
+                  digest = hashlib.sha256(source.read_bytes()).hexdigest()
+                  if source.name in copied and copied[source.name] != digest:
+                      raise SystemExit(f"Conflicting APKs: {source.name}")
+                  shutil.copy2(source, packages / source.name)
+                  copied[source.name] = digest
+          (bundle / "sha256sums").write_text("".join(
+              f"{digest}  packages/{name}\n" for name, digest in sorted(copied.items())))
+          (bundle / "selected-packages.txt").write_text("\n".join(sorted(selected)) + "\n")
+          shutil.copy2("files/etc/flint3e-build-id", bundle / "firmware-build-id")
+          print(f"Collected {len(copied)} signed APKs for {len(selected)} selected packages.")
+          PY
+          cat > "$GITHUB_WORKSPACE/offline/openclash-offline/install.sh" <<'EOF'
+          #!/bin/sh
+          set -eu
+          cd "$(dirname "$0")"
+          expected=$(cat firmware-build-id)
+          actual=$(cat /rom/etc/flint3e-build-id 2>/dev/null || cat /etc/flint3e-build-id 2>/dev/null || true)
+          if [ "$expected" != "$actual" ]; then
+            echo "This bundle requires the firmware from the same Actions run."
+            exit 1
+          fi
+          sha256sum -c sha256sums
+          df -h /overlay
+          set -- ./packages/*.apk
+          [ -f "$1" ]
+          # Use only local files and packages already installed in the matching firmware.
+          # Package signatures are checked against the keys built into that firmware.
+          apk add --no-network --simulate "$@"
+          apk add --no-network "$@"
+          echo "OpenClash installed. Refresh LuCI, open Services > OpenClash."
+          echo "Download the ARM64 proxy core and import a Clash/Mihomo configuration."
+          EOF
+          chmod 755 "$GITHUB_WORKSPACE/offline/openclash-offline/install.sh"
+          tar -C "$GITHUB_WORKSPACE/offline" -czf "$GITHUB_WORKSPACE/offline/openclash-offline.tar.gz" openclash-offline
+
+      - name: Collect firmware and build information
+        working-directory: openwrt
+        run: |
+          output="$GITHUB_WORKSPACE/firmware"
+          target_dir=bin/targets/qualcommbe/ipq53xx
+          mkdir -p "$output"
+          shopt -s nullglob
+          firmware_files=("$target_dir"/*gl-be6500*.bin "$target_dir"/*gl-be6500*.ubi)
+          if (( ${#firmware_files[@]} == 0 )); then
+            echo "::error::Build produced no GL-BE6500 firmware images."
+            exit 1
+          fi
+          cp "${firmware_files[@]}" "$output/"
+          for info in "$target_dir"/*.buildinfo "$target_dir"/profiles.json \
+            "$target_dir"/*gl-be6500*.manifest; do
+            [[ ! -f "$info" ]] || cp "$info" "$output/"
+          done
+          cp "$GITHUB_WORKSPACE/build-logs/"{source-commit.txt,feed-commits.txt,openclash-commit.txt,firmware-build-id,build.config,diffconfig.txt,image-check.log} "$output/"
+          cd "$output"
+          sha256sum -- *.bin *.ubi > sha256sums
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v7
+        with:
+          name: flint3e-openclash-firmware-${{ github.run_number }}
+          path: firmware/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload matching offline OpenClash packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: flint3e-openclash-packages-${{ github.run_number }}
+          path: offline/openclash-offline.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload logs and configuration
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: flint3e-openclash-build-logs-${{ github.run_number }}
+          path: build-logs/
+          if-no-files-found: ignore
+          retention-days: 7
